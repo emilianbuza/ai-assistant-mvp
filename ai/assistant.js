@@ -1,196 +1,117 @@
-// ai/assistant.js
-// Nutzt OpenAI, um aus Items (Slack/Gmail) Zusammenfassung + priorisierte Aufgaben zu erzeugen.
+import OpenAI from "openai";
+import dotenv from "dotenv";
+dotenv.config();
 
-const OpenAI = require('openai');
+const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Hilfsfunktion: OpenAI Client
-function clientFor(apiKey) {
-  if (!apiKey) throw new Error('OPENAI_API_KEY missing');
-  return new OpenAI({ apiKey });
-}
-
-// Kurzer, robuster Serializer für die Items
-function serializeItems(items = []) {
-  return items.slice(0, 40).map((it, i) => {
-    const dt = it.ts ? new Date(it.ts).toISOString() : '';
-    const title = it.title ? String(it.title).slice(0, 120) : '';
-    const content = (it.content || '').replace(/\s+/g, ' ').slice(0, 800);
-    const source = it.source || 'unknown';
-    return `${i + 1}. [${source}] ${title} — ${content} (${dt})`;
-  }).join('\n');
-}
-
-// Zusammenfassung
-async function summarizeItems({ apiKey, items }) {
-  const openai = clientFor(apiKey);
-  const content = [
-    {
-      role: 'system',
-      content:
-        'Du bist ein präziser Executive Assistant. Fasse knappe, belastbare Bullet-Points zusammen. Keine Erfindungen.',
-    },
-    {
-      role: 'user',
-      content:
-        `Fasse die folgenden Nachrichten, E-Mails und Notizen in 5–8 prägnanten Punkten zusammen. Hebe Termine/Fristen hervor:\n\n${serializeItems(items)}`,
-    },
-  ];
-
-  const resp = await safeRespond(openai, content);
-  return resp;
-}
-
-// Priorisierung
-async function prioritizeItems({ apiKey, items }) {
-  const openai = clientFor(apiKey);
-  const content = [
-    {
-      role: 'system',
-      content:
-        'Du agierst als Chief of Staff. Erzeuge eine klare, priorisierte Tages-To-Do-Liste. Maximal 8 Tasks. Jede Task mit: title, reason, priority (1-5, 1=kritisch), due (ISO oder leer), sourceIds (IDs als Liste). Antworte NUR als JSON-Array.',
-    },
-    {
-      role: 'user',
-      content:
-        `Hier sind Inputs (mit IDs). Forme daraus die Tagesliste. Keine Dubletten. Ziehe Termine/Eskalationen vor. JSON ONLY:\n\n${JSON.stringify(items.map(i => ({
-          id: i.id,
-          source: i.source,
-          title: i.title,
-          content: (i.content || '').slice(0, 1000),
-          ts: i.ts || null,
-        })), null, 2)}`,
-    },
-  ];
-
-  const raw = await safeRespond(openai, content);
-  const tasks = tryParseJsonArray(raw);
-  if (Array.isArray(tasks)) return sanitizeTasks(tasks);
-  // Fallback: einfache Heuristik
-  return heuristicTasks(items);
-}
-
-// Kombi für /tasks
-async function buildDailyActionList({ apiKey, items }) {
-  const [summary, tasks] = await Promise.all([
-    summarizeItems({ apiKey, items }),
-    prioritizeItems({ apiKey, items }),
-  ]);
-  return { summary, tasks };
-}
-
-// OpenAI Helper: Responses API mit Fallback
-async function safeRespond(openai, messages) {
-  // Versuche Responses API
+function tryExtractJSON(text) {
   try {
-    const r = await openai.responses.create({
-      model: process.env.OPENAI_MODEL || 'gpt-4.1-mini',
-      input: messages.map(m => `${m.role.toUpperCase()}: ${m.content}`).join('\n\n'),
-      temperature: 0.2,
-    });
-    const text = extractTextFromResponse(r);
-    if (text) return text.trim();
-  } catch (_) {
-    // ignore, fallback unten
-  }
-
-  // Fallback: Chat Completions
-  const r2 = await openai.chat.completions.create({
-    model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
-    temperature: 0.2,
-    messages,
-  });
-  return (r2.choices?.[0]?.message?.content || '').trim();
-}
-
-function extractTextFromResponse(r) {
-  const c = r?.output_text;
-  if (c && typeof c === 'string') return c;
-  const blocks = r?.output || r?.content || [];
-  if (Array.isArray(blocks)) {
-    const txt = blocks
-      .map(b => (typeof b === 'string' ? b : (b?.text || b?.content || '')))
-      .filter(Boolean)
-      .join('\n');
-    if (txt) return txt;
-  }
-  return null;
-}
-
-function tryParseJsonArray(s) {
-  if (!s || typeof s !== 'string') return null;
-  const start = s.indexOf('[');
-  const end = s.lastIndexOf(']');
-  if (start === -1 || end === -1 || end <= start) return null;
-  try {
-    return JSON.parse(s.slice(start, end + 1));
+    // Finde den JSON-Block in der Antwort
+    const match = text.match(/\{[\s\S]*\}|\[[\s\S]*\]/);
+    if (!match) return null;
+    return JSON.parse(match[0]);
   } catch {
     return null;
   }
 }
 
-function sanitizeTasks(tasks) {
-  const out = [];
-  for (const t of tasks) {
-    if (!t || typeof t !== 'object') continue;
-    const title = String(t.title || '').trim();
-    if (!title) continue;
-    const reason = String(t.reason || '').trim();
-    let priority = Number.isFinite(t.priority) ? Number(t.priority) : 3;
-    priority = Math.min(5, Math.max(1, priority));
-    const due = t.due ? String(t.due).trim() : '';
-    const sourceIds = Array.isArray(t.sourceIds) ? t.sourceIds.slice(0, 8).map(String) : [];
-    out.push({ title, reason, priority, due, sourceIds });
+export async function analyzeToTasks(messages = []) {
+  if (!messages || !messages.length) {
+    return [
+      {
+        title: "Keine Nachrichten gefunden",
+        priority: 3,
+        reason: "",
+        effort_minutes: 0,
+        due: null,
+        suggested_timebox: null,
+        steps: []
+      }
+    ];
   }
-  // Sortieren: priority asc, dann due (falls vorhanden)
-  out.sort((a, b) => {
-    if (a.priority !== b.priority) return a.priority - b.priority;
-    if (a.due && b.due) return new Date(a.due) - new Date(b.due);
-    if (a.due) return -1;
-    if (b.due) return 1;
-    return 0;
+
+  const corpus = messages
+    .map(
+      (m, i) =>
+        `${i + 1}. Quelle: ${m.source || "Gmail"} | Betreff: ${m.subject || "—"} | Inhalt: ${m.text || m.snippet || ""}`
+    )
+    .join("\n");
+
+  const systemPrompt = `
+Du bist ein KI-Assistent, der eingehende E-Mails und Benachrichtigungen analysiert und daraus eine priorisierte To-Do-Liste erstellt.
+
+Antworte AUSSCHLIESSLICH mit gültigem JSON nach diesem Schema:
+{
+  "tasks": [
+    {
+      "title": "kurze prägnante Aufgabenbeschreibung im Imperativ",
+      "priority": 1, // 1=Dringend (heute), 2=Wichtig (48h), 3=Später
+      "reason": "kurze Begründung, warum diese Priorität angemessen ist",
+      "effort_minutes": 10,
+      "due": "2025-10-21T15:00:00" oder null,
+      "suggested_timebox": "Heute 14:00–14:30" oder null,
+      "steps": ["maximal 5 konkrete Handlungsschritte"]
+    }
+  ]
+}
+
+Vermeide Einleitungen, Erklärungen, Fließtext oder Markdown.
+`;
+
+  const userPrompt = `Analysiere folgende E-Mails und extrahiere daraus Aufgaben mit Priorität, Begründung, Zeitaufwand und Schrittfolge:
+${corpus}`;
+
+  const completion = await client.chat.completions.create({
+    model: "gpt-4o-mini",
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt }
+    ],
+    temperature: 0.2,
+    max_tokens: 1200
   });
-  return out.slice(0, 8);
+
+  const rawOutput = completion.choices?.[0]?.message?.content?.trim() || "";
+  const parsed = tryExtractJSON(rawOutput);
+
+  if (parsed?.tasks && Array.isArray(parsed.tasks)) {
+    const normalized = parsed.tasks.map((t) => ({
+      title: String(t.title || "").trim(),
+      priority: Number(t.priority || 3),
+      reason: String(t.reason || ""),
+      effort_minutes: Number(t.effort_minutes || 30),
+      due: t.due || null,
+      suggested_timebox: t.suggested_timebox || null,
+      steps: Array.isArray(t.steps) ? t.steps.slice(0, 5) : []
+    }));
+    normalized.sort((a, b) => a.priority - b.priority || a.effort_minutes - b.effort_minutes);
+    return normalized;
+  }
+
+  // Fallback, falls GPT wieder kein gültiges JSON liefert
+  return [
+    {
+      title: "Analyse fehlgeschlagen – bitte erneut versuchen",
+      priority: 3,
+      reason: "Antwort enthielt kein gültiges JSON",
+      effort_minutes: 10,
+      due: null,
+      suggested_timebox: "Heute 16:00–16:10",
+      steps: ["Eingabe prüfen", "Erneut analysieren"]
+    }
+  ];
 }
 
-// Heuristischer Fallback, wenn JSON nicht parsebar
-function heuristicTasks(items = []) {
-  const ranked = items
-    .map(i => ({
-      title: guessTitle(i),
-      reason: `Relevanz aus ${i.source}`,
-      priority: guessPriority(i),
-      due: guessDue(i),
-      sourceIds: [i.id],
-    }))
-    .sort((a, b) => a.priority - b.priority)
-    .slice(0, 8);
-  return ranked;
+export async function summarizeMessages(messages = []) {
+  const joined = messages.map((m) => `${m.source || "Gmail"}: ${m.text || m.snippet || ""}`).join("\n");
+  const completion = await client.chat.completions.create({
+    model: "gpt-4o-mini",
+    messages: [
+      { role: "system", content: "Fasse die Inhalte prägnant in maximal 5 Punkten zusammen." },
+      { role: "user", content: joined }
+    ],
+    temperature: 0.3,
+    max_tokens: 400
+  });
+  return completion.choices[0].message.content.trim();
 }
-
-function guessTitle(i) {
-  if (!i) return 'Aufgabe';
-  const title = (i.title || '').trim();
-  if (title) return title;
-  const firstWords = (i.content || '').split(/\s+/).slice(0, 6).join(' ');
-  return firstWords || 'Aufgabe';
-}
-
-function guessPriority(i) {
-  const c = `${i.title || ''} ${i.content || ''}`.toLowerCase();
-  if (/\b(deadline|due|eod|morgen|tomorrow|urgent|dringend|fr(i|ist))\b/.test(c)) return 1;
-  if (/\b(meeting|termin|call|review)\b/.test(c)) return 2;
-  if (/\b(client|kunde|proposal|angebot)\b/.test(c)) return 2;
-  return 3;
-}
-
-function guessDue(i) {
-  const c = `${i.title || ''} ${i.content || ''}`.toLowerCase();
-  if (/\btoday|heute|eod\b/.test(c)) return new Date().toISOString().slice(0, 10);
-  return '';
-}
-
-module.exports = {
-  summarizeItems,
-  prioritizeItems,
-  buildDailyActionList,
-};
