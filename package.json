@@ -1,0 +1,29 @@
+{
+  "name": "ai-assistant-mvp",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/emilianbuza/ai-assistant-mvp.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/emilianbuza/ai-assistant-mvp/issues"
+  },
+  "homepage": "https://github.com/emilianbuza/ai-assistant-mvp#readme",
+  "dependencies": {
+    "@slack/web-api": "^7.11.0",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^5.1.0",
+    "googleapis": "^164.1.0",
+    "openai": "^6.6.0"
+  },
+  "description": ""
+}
